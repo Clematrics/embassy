@@ -344,7 +344,16 @@ impl SdmmcPeripheral {
     fn get_capacity(&self) -> CardCapacity {
         match self {
             Self::SdCard(c) => c.card_type,
-            Self::Emmc(e) => e.capacity,
+            Self::Emmc(e) => {
+                // If the device capacity is greater than 2GiB, addressing is always done
+                // by sector index, regardless of the card_type found in the CSD
+                // See Note 1 in table 52 of JEDEC Standard No. 84-B51
+                if u64::from(e.ext_csd.sector_count()) * 512 >= (2 << 30) {
+                    CardCapacity::HighCapacity
+                } else {
+                    e.capacity
+                }
+            }
         }
     }
     /// Size in bytes
