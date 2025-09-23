@@ -1263,13 +1263,14 @@ impl<'d, T: Instance> Sdmmc<'d, T> {
                 on_drop.defuse();
                 Self::stop_datapath();
                 drop(transfer);
+                let card = self.card.ok_or(Error::NoCard)?;
 
                 // TODO: Make this configurable
                 let mut timeout: u32 = 0x00FF_FFFF;
 
                 // Try to read card status (ACMD13)
                 while timeout > 0 {
-                    match self.read_sd_status().await {
+                    match self.read_status::<T>(&card) {
                         Ok(_) => return Ok(()),
                         Err(Error::Timeout) => (), // Try again
                         Err(e) => return Err(e),
