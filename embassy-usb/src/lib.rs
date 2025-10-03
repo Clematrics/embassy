@@ -13,6 +13,7 @@ pub mod control;
 pub mod descriptor;
 mod descriptor_reader;
 pub mod msos;
+mod packed;
 pub mod types;
 
 mod config {

@@ -6,3 +6,4 @@ pub mod hid;
 pub mod midi;
 pub mod uac1;
 pub mod web_usb;
+pub mod msc;
