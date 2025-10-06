@@ -1270,10 +1270,13 @@ impl<'d, T: Instance> Sdmmc<'d, T> {
 
                 // Try to read card status (ACMD13)
                 while timeout > 0 {
-                    match self.read_status::<T>(&card) {
-                        Ok(_) => return Ok(()),
-                        Err(Error::Timeout) => (), // Try again
-                        Err(e) => return Err(e),
+                    let ready_for_data = match card {
+                        SdmmcPeripheral::Emmc(_) => self.read_status::<EMMC>(&card)?.ready_for_data(),
+                        SdmmcPeripheral::SdCard(_) => self.read_status::<SD>(&card)?.ready_for_data(),
+                    };
+
+                    if ready_for_data {
+                        return Ok(());
                     }
                     timeout -= 1;
                 }
