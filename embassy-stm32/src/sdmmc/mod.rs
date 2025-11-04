@@ -10,7 +10,7 @@ use core::task::Poll;
 use embassy_hal_internal::drop::OnDrop;
 use embassy_hal_internal::{Peri, PeripheralType};
 use embassy_sync::waitqueue::AtomicWaker;
-use sdio_host::common_cmd::{self, Resp, ResponseLen};
+use sdio_host::common_cmd::{self, cmd, Resp, ResponseLen, R1};
 use sdio_host::emmc::{ExtCSD, EMMC};
 use sdio_host::sd::{BusWidth, CardCapacity, CardStatus, CurrentState, SDStatus, CIC, CID, CSD, OCR, RCA, SCR, SD};
 use sdio_host::{emmc_cmd, sd_cmd, Cmd};
@@ -1286,6 +1286,76 @@ impl<'d, T: Instance> Sdmmc<'d, T> {
         }
     }
 
+    pub async fn erase_blocks(&mut self, start_idx: u32, end_idx: u32) -> Result<(), Error> {
+        Self::cmd(emmc_cmd::erase_group_start(start_idx), false)?; // CMD35
+        Self::cmd(emmc_cmd::erase_group_end(end_idx), false)?; // CMD36
+        Self::cmd(common_cmd::erase(), false)?; // CMD38
+
+        let card = self.card.as_ref().unwrap();
+        loop {
+            let status = match card {
+                SdmmcPeripheral::SdCard(_) => panic!(),
+                SdmmcPeripheral::Emmc(_) => self.read_status::<EMMC>(card)?,
+            };
+
+            if status.out_of_range() {
+                error!("Erase: out of range");
+                return Err(Error::StBitErr);
+            }
+            if status.erase_seq_error() {
+                error!("Erase: err seq error");
+                return Err(Error::StBitErr);
+            }
+            if status.erase_reset() {
+                error!("Erase: reset");
+                return Err(Error::StBitErr);
+            }
+            if status.wp_erase_skip() {
+                error!("Erase: wp erase skip");
+                return Err(Error::StBitErr);
+            }
+
+            if status.ready_for_data() {
+                return Ok(());
+            }
+        }
+    }
+
+    pub async fn trim_blocks(&mut self, start_idx: u32, end_idx: u32) -> Result<(), Error> {
+        Self::cmd(emmc_cmd::erase_group_start(start_idx), false)?; // CMD35
+        Self::cmd(emmc_cmd::erase_group_end(end_idx), false)?; // CMD36
+        Self::cmd(cmd::<R1>(38, 0x1), false)?; // CMD38
+
+        let card = self.card.as_ref().unwrap();
+        loop {
+            let status = match card {
+                SdmmcPeripheral::SdCard(_) => panic!(),
+                SdmmcPeripheral::Emmc(_) => self.read_status::<EMMC>(card)?,
+            };
+
+            if status.out_of_range() {
+                error!("Erase: out of range");
+                return Err(Error::StBitErr);
+            }
+            if status.erase_seq_error() {
+                error!("Erase: err seq error");
+                return Err(Error::StBitErr);
+            }
+            if status.erase_reset() {
+                error!("Erase: reset");
+                return Err(Error::StBitErr);
+            }
+            if status.wp_erase_skip() {
+                error!("Erase: wp erase skip");
+                return Err(Error::StBitErr);
+            }
+
+            if status.ready_for_data() {
+                return Ok(());
+            }
+        }
+    }
+
     /// Get a reference to the initialized card
     ///
     /// # Errors
@@ -1541,6 +1611,41 @@ impl<'d, T: Instance> Sdmmc<'d, T> {
             }
             SdmmcPeripheral::Emmc(_) => {
                 self.read_ext_csd().await?;
+
+                if freq.0 > 26_000_000 {
+                    self.switch_speed(0x1).await?; // 1 for High-Speed setting
+
+                    let mut status;
+                    while {
+                        status = regs.star().read();
+                        !(status.cmdrend() || status.ccrcfail())
+                    } {}
+
+                    if status.ccrcfail() {
+                        return Err(Error::SignalingSwitchFailed);
+                    }
+
+                    self.clkcr_set_clkdiv(freq.0, bus_width)?;
+
+                    // TODO: Make this configurable
+                    let mut timeout: u32 = 0x00FF_FFFF;
+
+                    let card = self.card.as_ref().unwrap();
+                    while timeout > 0 {
+                        let ready_for_data = match card {
+                            SdmmcPeripheral::Emmc(_) => self.read_status::<EMMC>(card)?.ready_for_data(),
+                            SdmmcPeripheral::SdCard(_) => self.read_status::<SD>(card)?.ready_for_data(),
+                        };
+
+                        if ready_for_data {
+                            return Ok(());
+                        }
+                        timeout -= 1;
+                    }
+                    if timeout == 0 {
+                        return Err(Error::SoftwareTimeout);
+                    }
+                }
             }
         }
 
@@ -1625,6 +1730,137 @@ impl<'d, T: Instance> Sdmmc<'d, T> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Enable backup operations
+    ///
+    /// eMMC only.
+    pub async fn enable_bkops(&mut self, auto: bool, manual: bool) -> Result<(), Error> {
+        let card = self.card.as_mut().ok_or(Error::NoCard)?;
+        assert!(matches!(card, SdmmcPeripheral::Emmc(_)));
+
+        let mask = 0u8 | (u8::from(auto) << 1) | u8::from(manual) ;
+        Self::cmd(
+            emmc_cmd::modify_ext_csd(emmc_cmd::AccessMode::SetBits, 163, mask),
+            false,
+        )?;
+
+        // Wait for ready after R1b response
+        loop {
+            let card = self.card.as_ref().unwrap();
+            let status = self.read_status::<EMMC>(&card)?;
+            if status.ready_for_data() {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Enable backup operations
+    ///
+    /// eMMC only.
+    pub async fn start_bkops(&mut self) -> Result<(), Error> {
+        let card = self.card.as_mut().ok_or(Error::NoCard)?;
+        assert!(matches!(card, SdmmcPeripheral::Emmc(_)));
+
+        Self::cmd(emmc_cmd::modify_ext_csd(emmc_cmd::AccessMode::SetBits, 164, 0x1), false)?;
+
+        // Wait for ready after R1b response
+        loop {
+            let card = self.card.as_ref().unwrap();
+            let status = self.read_status::<EMMC>(&card)?;
+            if status.ready_for_data() {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the current backup operations status
+    ///
+    /// eMMC only.
+    pub async fn bkops_status(&mut self) -> Result<u8, Error> {
+        self.read_ext_csd().await?;
+
+        let card = match self.card.as_mut().ok_or(Error::NoCard)? {
+            SdmmcPeripheral::Emmc(card) => card,
+            _ => unreachable!(),
+        };
+        let ext_csd_byte = |idx: usize| -> u8 { card.ext_csd.inner[idx / 4].to_le_bytes()[idx % 4] };
+
+        Ok(ext_csd_byte(246))
+    }
+
+    /// Enable cache
+    ///
+    /// eMMC only.
+    pub async fn enable_cache(&mut self) -> Result<(), Error> {
+        let card = self.card.as_mut().ok_or(Error::NoCard)?;
+        assert!(matches!(card, SdmmcPeripheral::Emmc(_)));
+
+        Self::cmd(emmc_cmd::modify_ext_csd(emmc_cmd::AccessMode::SetBits, 33, 0x01), false)?;
+
+        // Wait for ready after R1b response
+        loop {
+            let card = self.card.as_ref().unwrap();
+            let status = self.read_status::<EMMC>(&card)?;
+            if status.ready_for_data() {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Flush cache
+    ///
+    /// eMMC only.
+    pub async fn flush_cache(&mut self) -> Result<(), Error> {
+        let card = self.card.as_mut().ok_or(Error::NoCard)?;
+        assert!(matches!(card, SdmmcPeripheral::Emmc(_)));
+
+        Self::cmd(emmc_cmd::modify_ext_csd(emmc_cmd::AccessMode::SetBits, 32, 0x01), false)?;
+
+        // Wait for ready after R1b response
+        loop {
+            let card = self.card.as_ref().unwrap();
+            let status = self.read_status::<EMMC>(&card)?;
+            if status.ready_for_data() {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Switch speed mode using CMD6.
+    ///
+    /// Attempt to set a new signalling mode. The selected
+    /// signalling mode is returned. Expects the current clock
+    /// frequency to be > 12.5MHz.
+    ///
+    /// eMMC only.
+    async fn switch_speed(&mut self, speed: u8) -> Result<(), Error> {
+        let _ = self.card.as_mut().ok_or(Error::NoCard)?.get_emmc();
+
+        Self::cmd(
+            emmc_cmd::modify_ext_csd(emmc_cmd::AccessMode::WriteByte, 185, speed),
+            false,
+        )?;
+
+        // Wait for ready after R1b response
+        loop {
+            let card = self.card.as_ref().unwrap();
+            let status = self.read_status::<EMMC>(&card)?;
+
+            if status.ready_for_data() {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     /// Reads the SCR register.
@@ -1726,7 +1962,7 @@ impl<'d, T: Instance> Sdmmc<'d, T> {
     /// Gets the EXT_CSD register.
     ///
     /// eMMC only.
-    async fn read_ext_csd(&mut self) -> Result<(), Error> {
+    pub async fn read_ext_csd(&mut self) -> Result<(), Error> {
         let card = self.card.as_mut().ok_or(Error::NoCard)?.get_emmc();
 
         // Note: cmd_block can't be used because ExtCSD is too long to fit.
