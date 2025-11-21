@@ -1732,16 +1732,16 @@ impl<'d, T: Instance> Sdmmc<'d, T> {
         }
     }
 
-    /// Enable backup operations
+    /// Enable or disable backup operations
     ///
     /// eMMC only.
-    pub async fn enable_bkops(&mut self, auto: bool, manual: bool) -> Result<(), Error> {
+    pub async fn set_bkops(&mut self, auto: bool, manual: bool) -> Result<(), Error> {
         let card = self.card.as_mut().ok_or(Error::NoCard)?;
         assert!(matches!(card, SdmmcPeripheral::Emmc(_)));
 
-        let mask = 0u8 | (u8::from(auto) << 1) | u8::from(manual) ;
+        let mask = 0u8 | (u8::from(!auto) << 1) | u8::from(!manual);
         Self::cmd(
-            emmc_cmd::modify_ext_csd(emmc_cmd::AccessMode::SetBits, 163, mask),
+            emmc_cmd::modify_ext_csd(emmc_cmd::AccessMode::ClearBits, 163, mask),
             false,
         )?;
 
@@ -1754,10 +1754,24 @@ impl<'d, T: Instance> Sdmmc<'d, T> {
             }
         }
 
+        let mask = 0u8 | (u8::from(auto) << 1) | u8::from(manual);
+        Self::cmd(
+            emmc_cmd::modify_ext_csd(emmc_cmd::AccessMode::SetBits, 163, mask),
+            false,
+        )?;
+        // Wait for ready after R1b response
+        loop {
+            let card = self.card.as_ref().unwrap();
+            let status = self.read_status::<EMMC>(&card)?;
+            if status.ready_for_data() {
+                break;
+            }
+        }
+
         Ok(())
     }
 
-    /// Enable backup operations
+    /// Start backup operations
     ///
     /// eMMC only.
     pub async fn start_bkops(&mut self) -> Result<(), Error> {
